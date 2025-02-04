@@ -6,96 +6,122 @@ import re
 # Function to preprocess text
 def preprocess_text(text):
     """
-    Normalize text by converting to lowercase and stripping punctuation, but retain spaces.
+    Enhanced preprocessing to handle variations in business names
     """
-    if pd.isna(text):  # Handle NaN values
+    if pd.isna(text):
         return ""
-    original_text = str(text)  # Store original text for debugging
-    text = str(text).lower()  # Convert to lowercase
-    text = re.sub(r"[^\w\s]", "", text)  # Remove punctuation but retain spaces
-    print(f"Original: {original_text} -> Preprocessed: {text}")  # Debug statement
-    return text
+    
+    text = str(text).lower()
+    
+    # Remove common business suffixes
+    suffixes = ["limited", "ltd", "inc", "corporation", "llc", "fzc", "fzco", "international", "intl"]
+    text = " ".join([word for word in text.split() if word not in suffixes])
+    
+    # Remove special characters but keep spaces
+    text = re.sub(r"[^\w\s]", "", text)
+    
+    # Handle empty strings after preprocessing
+    if not text.strip():
+        return ""
+    
+    # Normalize spaces and join words
+    return " ".join(text.split())
+
+def calculate_overlap(str1, str2):
+    """
+    Enhanced overlap calculation with better handling of variations
+    """
+    words1 = set(str1.lower().split())
+    words2 = set(str2.lower().split())
+    
+    # Special handling for single-word matches
+    if len(words1) == 1 or len(words2) == 1:
+        # If one is a single word, check if it's a subset of the other
+        if words1.issubset(words2) or words2.issubset(words1):
+            return 1.0
+    
+    # Normal overlap calculation
+    overlap = len(words1 & words2) / max(len(words1), len(words2))
+    return overlap
 
 # Function to perform fuzzy duplicate removal
-def remove_fuzzy_duplicates(df, columns, threshold=80):
+def remove_fuzzy_duplicates(df, columns, similarity_threshold=80, overlap_threshold=0.5):
     """
     Remove fuzzy duplicates from a DataFrame based on selected columns.
-    Rows are considered duplicates if any one of the selected columns meets the threshold.
-    For the column 'Main Phone #', only exact matches are considered.
     Returns:
         - unique_df: DataFrame with unique rows.
         - duplicates_df: DataFrame with duplicate rows and their details.
         - similarity_details: Dictionary containing similarity scores and actual values for duplicates.
     """
+    # Reset index to ensure unique indices
+    df = df.reset_index(drop=True)
+    
+    # Create a preprocessed column for faster comparisons
+    df['preprocessed'] = df[columns[0]].apply(preprocess_text)
+    
+    # Group similar values together
+    groups = []
+    processed = set()
+    
+    for i, row in df.iterrows():
+        if i in processed:
+            continue
+        
+        # Find all similar rows
+        group = [i]
+        for j, compare_row in df.iterrows():
+            if j in processed or j == i:
+                continue
+            
+            str1 = df.at[i, 'preprocessed']
+            str2 = df.at[j, 'preprocessed']
+            
+            score = fuzz.ratio(str1, str2)
+            overlap = calculate_overlap(str1, str2)
+            
+            if (score >= similarity_threshold and overlap >= overlap_threshold) or \
+               (calculate_overlap(str1, str2) == 1.0 and score >= 50):
+                group.append(j)
+                processed.add(j)
+        
+        if len(group) > 1:
+            groups.append(group)
+        processed.add(i)
+    
+    # Create duplicates DataFrame
     duplicates = []
-    unique_data = []
-    similarity_details = {}  # Store similarity scores and actual values for duplicates
-    total_rows = len(df)
-    progress_bar = st.progress(0)  # Initialize progress bar
-
-    for index, row in df.iterrows():
-        match_found = False
-        for unique_row in unique_data:
-            # Check if any one of the selected columns meets the threshold
-            is_duplicate = False
-            scores = {}  # Store scores for the current comparison
-            actual_values = {}  # Store actual values for the current comparison
-            for col in columns:
-                if col == "Main Phone #":
-                    # Perform exact match for 'Main Phone #'
-                    str1 = str(row[col]).strip()  # Exact match, no preprocessing
-                    str2 = str(unique_row[col]).strip()
-                    if str1 == str2:
-                        is_duplicate = True
-                        scores[col] = 100  # Exact match score is 100
-                        actual_values[col] = {
-                            "Duplicate Value": str1,
-                            "Original Value": str2,
-                        }
-                        break
-                else:
-                    # Perform fuzzy match for other columns
-                    str1 = preprocess_text(row[col])
-                    str2 = preprocess_text(unique_row[col])
-                    score = fuzz.token_set_ratio(str1, str2)  # Use fuzz.token_set_ratio for better matching
-                    scores[col] = score  # Store the score for this column
-                    actual_values[col] = {
-                        "Duplicate Value": row[col],
-                        "Original Value": unique_row[col],
-                    }
-                    print(f"Comparing '{str1}' (Row {index}) with '{str2}' (Row {unique_row.name}) in column '{col}': Score = {score}")  # Debug statement
-                    if score >= threshold:
-                        is_duplicate = True
-                        break  # No need to check other columns if one meets the threshold
-
-            if is_duplicate:
-                duplicates.append((index, unique_row.name))
-                similarity_details[(index, unique_row.name)] = {
-                    "Scores": scores,
-                    "Actual Values": actual_values,
-                }  # Store scores and actual values for this duplicate pair
-                match_found = True
-                break  # No need to check other unique rows if a match is found
-
-        if not match_found:
-            unique_data.append(row)
-
-        # Update progress bar
-        progress = (index + 1) / total_rows
-        progress_bar.progress(progress)
-
-    # Create a DataFrame of unique rows
-    unique_df = pd.DataFrame(unique_data).reset_index(drop=True)
-
-    # Create a DataFrame of duplicates with details
-    duplicates_df = pd.DataFrame(duplicates, columns=["Duplicate Index", "Original Index"])
-
-    # Add similarity details to the duplicates DataFrame
-    duplicates_df["Similarity Details"] = duplicates_df.apply(
-        lambda row: similarity_details.get((row["Duplicate Index"], row["Original Index"]), {}), axis=1
-    )
-
-    return unique_df, duplicates_df
+    similarity_details = {}
+    
+    for group in groups:
+        original_index = group[0]
+        for duplicate_index in group[1:]:
+            duplicates.append((duplicate_index, original_index))
+            # Store similarity details
+            str1 = df.at[original_index, columns[0]]
+            str2 = df.at[duplicate_index, columns[0]]
+            score = fuzz.ratio(str1, str2)
+            overlap = calculate_overlap(str1, str2)
+            similarity_details[(duplicate_index, original_index)] = {
+                "Scores": {columns[0]: score},
+                "Actual Values": {columns[0]: {
+                    "Duplicate Value": str2,
+                    "Original Value": str1
+                }}
+            }
+    
+    # Create unique and duplicates DataFrames
+    unique_indices = list(set(df.index) - {d[0] for d in duplicates})
+    unique_df = df.loc[unique_indices].drop(columns=['preprocessed'])
+    
+    duplicates_indices = list({d[0] for d in duplicates})
+    duplicates_df = df.loc[duplicates_indices].drop(columns=['preprocessed'])
+    
+    # Add duplicate details to the duplicates DataFrame
+    duplicates_df['Duplicate Index'] = [d[0] for d in duplicates]
+    duplicates_df['Original Index'] = [d[1] for d in duplicates]
+    duplicates_df['Similarity Details'] = [similarity_details[d] for d in duplicates]
+    
+    return unique_df, duplicates_df, similarity_details
 
 # Streamlit App
 def main():
@@ -121,11 +147,17 @@ def main():
             # Step 2: Select columns for duplicate check
             columns = st.multiselect("Select columns for duplicate check", df.columns)
             if columns:
-                threshold = st.slider("Set fuzzy match threshold (0-100)", 0, 100, 80)
+                similarity_threshold = st.slider("Similarity Score Threshold", 0, 100, 80)
+                overlap_threshold = st.slider("Word Overlap Threshold", 0.0, 1.0, 0.5)
 
                 if st.button("Remove Duplicates"):
-                    # Step 3: Perform fuzzy duplicate removal
-                    unique_df, duplicates_df = remove_fuzzy_duplicates(df, columns, threshold)
+                    with st.spinner("Processing duplicates..."):
+                        unique_df, duplicates_df, similarity_details = remove_fuzzy_duplicates(
+                            df,
+                            columns,
+                            similarity_threshold=similarity_threshold,
+                            overlap_threshold=overlap_threshold
+                        )
 
                     # Step 4: Show changes
                     st.write(f"Number of duplicates removed: {len(duplicates_df)}")
