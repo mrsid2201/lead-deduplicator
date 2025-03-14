@@ -1,0 +1,10 @@
+Metadata-Version: 2.2
+Name: lead-deduplicator
+Version: 0.1.0
+Requires-Dist: pandas>=1.5.0
+Requires-Dist: streamlit>=1.22.0
+Requires-Dist: fuzzywuzzy>=0.18.0
+Requires-Dist: python-Levenshtein>=0.20.9
+Requires-Dist: numpy>=1.23.0
+Requires-Dist: openpyxl>=3.1.0
+Dynamic: requires-dist
