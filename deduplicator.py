@@ -437,7 +437,7 @@ def remove_fuzzy_duplicates(df, columns, similarity_threshold=DEFAULT_SIMILARITY
 def check_against_master_files(df, customer_df, columns, similarity_threshold=DEFAULT_SIMILARITY_THRESHOLD, overlap_threshold=DEFAULT_OVERLAP_THRESHOLD):
     """
     Check for duplicates against master files with improved performance and user feedback.
-    Name columns must meet the threshold for records to be considered duplicates.
+    For customer master file, only exact columns "Address", "Customer Name", and "Main Phone Number" are used.
     """
     # Create a copy of the input DataFrame to add duplicate status
     result_df = df.copy()
@@ -513,16 +513,23 @@ def check_against_master_files(df, customer_df, columns, similarity_threshold=DE
                     name_overlaps = {}
                     other_overlaps = {}
                     
+                    # For customer master file, only use the exact specified columns
+                    if file_name == 'Customer Master File':
+                        # Only use exact column matches for customer master file
+                        customer_master_columns = ['Address', 'Customer Name', 'Main Phone Number']
+                        
+                        # Create mapping from input columns to customer master columns
+                        column_mapping = {}
+                        for col in columns:
+                            # Only map columns that exactly match the required customer master columns
+                            if col in customer_master_columns:
+                                column_mapping[col] = col
+                    else:
+                        # For other master files, use direct column mapping
+                        column_mapping = {col: col for col in columns if col in master_columns}
+                    
                     for col in columns:
-                        master_col = col  # Default mapping
-                        # Map columns based on name patterns
-                        if col not in master_columns:
-                            if any(term in col.lower() for term in ['name', 'company']):
-                                master_col = next((c for c in master_columns if 'name' in c.lower()), None)
-                            elif any(term in col.lower() for term in ['phone', 'mobile', 'tel']):
-                                master_col = next((c for c in master_columns if 'phone' in c.lower()), None)
-                            elif any(term in col.lower() for term in ['address', 'location']):
-                                master_col = next((c for c in master_columns if 'address' in c.lower()), None)
+                        master_col = column_mapping.get(col)
                         
                         if master_col and master_col in master_processed.columns:
                             str1 = row[f'preprocessed_{col}']
@@ -571,8 +578,8 @@ def check_against_master_files(df, customer_df, columns, similarity_threshold=DE
                 if matches_found > 0 and matches_found % 10 == 0:
                     details_container.info(f"Found {matches_found} matches in {file_name}")
     
-    # Process customer master file
-    customer_columns = ['Customer Name', 'Address', 'Main Phone Number']
+    # Process customer master file - explicitly use only the three required columns with exact names
+    customer_columns = ['Address', 'Customer Name', 'Main Phone Number']
     process_master_file(df_processed, customer_df, customer_columns, 'Customer Master File')
     
     # Clear progress indicators
@@ -587,24 +594,90 @@ def check_against_master_files(df, customer_df, columns, similarity_threshold=DE
     
     return result_df
 
-# UI Components
-def load_data(uploaded_file):
-    """Load data from uploaded file"""
-    if uploaded_file.name.endswith('.xlsx'):
-        df = pd.read_excel(uploaded_file)
-    elif uploaded_file.name.endswith('.csv'):
-        df = pd.read_csv(uploaded_file)
-    else:
-        st.error("Unsupported file format. Please upload an Excel or CSV file.")
-        return None
+# Function to check for exact matches between customer duplicates and account master file
+def check_account_master_matches(tagged_df, account_df):
+    """
+    Check for exact matches between customer duplicates and account master file.
+    Only checks records that are duplicates against Customer Master File.
+    Uses exact matching between Customer Name and Account Name fields.
+    """
+    if account_df is None or len(account_df) == 0:
+        return tagged_df
     
-    # Convert all columns to string to ensure consistent processing
-    for col in df.columns:
-        df[col] = df[col].astype(str)
+    # Create a copy of the tagged dataframe
+    result_df = tagged_df.copy()
     
-    return df
+    # Add Account Number and Last Shipment Date columns
+    result_df['Account Number'] = None
+    result_df['Last Shipment Date'] = None
+    
+    # Create containers for progress tracking
+    status_container = st.empty()
+    progress_container = st.empty()
+    eta_container = st.empty()
+    
+    # Get only the records that are duplicates against Customer Master File
+    customer_duplicates = result_df[result_df['Customer_DB_Status'] == 'Duplicate against Customer DB']
+    
+    if len(customer_duplicates) == 0:
+        status_container.info("No customer duplicates found to check against Account Master File.")
+        status_container.empty()
+        return result_df
+    
+    status_container.info(f"🔍 Checking {len(customer_duplicates)} customer duplicates against Account Master File...")
+    
+    # Process in batches for better performance
+    BATCH_SIZE = 1000
+    total_batches = (len(customer_duplicates) + BATCH_SIZE - 1) // BATCH_SIZE
+    start_time = time.time()
+    matches_found = 0
+    
+    for batch_idx in range(total_batches):
+        # Calculate batch indices
+        start_idx = batch_idx * BATCH_SIZE
+        end_idx = min((batch_idx + 1) * BATCH_SIZE, len(customer_duplicates))
+        batch_indices = customer_duplicates.index[start_idx:end_idx]
+        
+        # Update progress
+        progress = (batch_idx + 1) / total_batches
+        progress_container.progress(progress)
+        
+        # Calculate ETA
+        elapsed_time = time.time() - start_time
+        estimated_total_time = elapsed_time / progress if progress > 0 else 0
+        remaining_time = estimated_total_time - elapsed_time
+        eta_container.info(f"⏱️ Estimated time remaining: {remaining_time:.1f} seconds")
+        
+        # Process each duplicate record in the batch
+        for idx in batch_indices:
+            # Get the customer name for this record
+            customer_name = tagged_df.at[idx, 'Customer Name'] if 'Customer Name' in tagged_df.columns else ""
+            
+            if customer_name and not pd.isna(customer_name):
+                # Check for exact match with Account Name in account_df
+                exact_matches = account_df[account_df['Account Name'].str.lower() == customer_name.lower()]
+                
+                if len(exact_matches) > 0:
+                    # Get the first match
+                    match = exact_matches.iloc[0]
+                    
+                    # Add Account Number and Last Shipment Date to the result
+                    if 'Account Number' in match:
+                        result_df.at[idx, 'Account Number'] = match['Account Number']
+                    
+                    if 'Last Shipment Date' in match:
+                        result_df.at[idx, 'Last Shipment Date'] = match['Last Shipment Date']
+                    
+                    matches_found += 1
+    
+    # Clear progress indicators
+    status_container.info(f"✅ Found {matches_found} matches in Account Master File.")
+    progress_container.empty()
+    eta_container.empty()
+    
+    return result_df
 
-def generate_tagged_data(df, dup_groups, columns, similarity_details, customer_df=None):
+def generate_tagged_data(df, dup_groups, columns, similarity_details, customer_df=None, account_df=None):
     """
     Generate tagged data with duplicate status:
     - Original: The earliest record by Created Date or first record if dates are identical
@@ -615,12 +688,15 @@ def generate_tagged_data(df, dup_groups, columns, similarity_details, customer_d
     - Similarity_Details column with JSON-formatted similarity and overlap scores
     - Customer_DB_Status column indicating if the record is a duplicate against Customer DB
     - Customer_DB_Details column with JSON-formatted similarity and overlap scores for customer DB matches
+    - Account Number and Last Shipment Date columns for records matched with Account Master File
     """
     tagged_df = df.copy()
     tagged_df['Duplicate Status'] = 'Not Duplicate'
     tagged_df['Similarity_Details'] = None
     tagged_df['Customer_DB_Status'] = 'Not duplicate against Customer DB'
     tagged_df['Customer_DB_Details'] = None
+    tagged_df['Account Number'] = None
+    tagged_df['Last Shipment Date'] = None
     
     # Process each duplicate group
     for group in dup_groups:
@@ -700,7 +776,59 @@ def generate_tagged_data(df, dup_groups, columns, similarity_details, customer_d
                     # Store as JSON string
                     tagged_df.at[idx, 'Similarity_Details'] = json.dumps(json_details)
     
-    # For now, skip the customer DB check to ensure the basic functionality works
+    # Check against customer master file if available
+    if customer_df is not None and len(customer_df) > 0:
+        # Use specified columns for customer master file check
+        customer_columns = ['Address', 'Customer Name', 'Main Phone Number']
+        
+        # Only check columns that exist in both dataframes
+        valid_columns = [col for col in customer_columns if col in df.columns and col in customer_df.columns]
+        
+        if valid_columns:
+            st.info("Checking duplicates against Customer Master File...")
+            # Implementing a simplified check here focusing on exact matches for Customer Name
+            for idx, row in tagged_df.iterrows():
+                if 'Customer Name' in valid_columns and 'Customer Name' in customer_df.columns:
+                    customer_name = row.get('Customer Name', '')
+                    if customer_name and not pd.isna(customer_name):
+                        # Look for exact matches in customer master file
+                        matches = customer_df[customer_df['Customer Name'].str.lower() == customer_name.lower()]
+                        if len(matches) > 0:
+                            tagged_df.at[idx, 'Customer_DB_Status'] = 'Duplicate against Customer DB'
+                            
+                            # Create details JSON
+                            details = {
+                                'Customer Name': {
+                                    'similarity': 100,  # Exact match
+                                    'original_value': customer_name,
+                                    'master_value': matches.iloc[0]['Customer Name']
+                                }
+                            }
+                            tagged_df.at[idx, 'Customer_DB_Details'] = json.dumps(details)
+    
+    # Check against account master file if available
+    if account_df is not None and len(account_df) > 0:
+        # Only proceed with account master file check for records that are duplicates against customer master file
+        st.info("Checking customer duplicates against Account Master File...")
+        customer_duplicates = tagged_df[tagged_df['Customer_DB_Status'] == 'Duplicate against Customer DB']
+        
+        if len(customer_duplicates) > 0 and 'Customer Name' in tagged_df.columns and 'Account Name' in account_df.columns:
+            for idx in customer_duplicates.index:
+                customer_name = tagged_df.at[idx, 'Customer Name']
+                if customer_name and not pd.isna(customer_name):
+                    # Look for exact matches in account master file
+                    exact_matches = account_df[account_df['Account Name'].str.lower() == customer_name.lower()]
+                    
+                    if len(exact_matches) > 0:
+                        # Get the first match
+                        match = exact_matches.iloc[0]
+                        
+                        # Add Account Number and Last Shipment Date to the tagged dataframe
+                        if 'Account Number' in match:
+                            tagged_df.at[idx, 'Account Number'] = match['Account Number']
+                        
+                        if 'Last Shipment Date' in match:
+                            tagged_df.at[idx, 'Last Shipment Date'] = match['Last Shipment Date']
     
     return tagged_df
 
@@ -726,6 +854,7 @@ def render_download_buttons(df, final_df=None, tagged_df=None, master_check_df=N
         - The 'Similarity_Details' column contains JSON-formatted similarity scores and overlap details for each duplicate record.
         - The 'Customer_DB_Status' column indicates if the record is a duplicate against the Customer DB.
         - The 'Customer_DB_Details' column contains JSON-formatted similarity scores and overlap details for matches against the Customer DB.
+        - The 'Account Number' and 'Last Shipment Date' columns show data from the Account Master File for matching records.
         """)
         
         st.download_button(
@@ -761,19 +890,30 @@ def main():
     # File uploader with a dedicated key so the uploaded file remains available
     uploaded_file = st.file_uploader("Upload Excel or CSV file for duplicate check", type=["xlsx", "csv"], key="uploaded_file")
     
-    # Customer Master File uploader
+    # Master Files Section - with separate sections for each master file
     st.markdown('<div class="master-files-section">', unsafe_allow_html=True)
+    
+    # Customer Master File uploader
     st.markdown('<div class="master-file-header">Customer Master File (Optional)</div>', unsafe_allow_html=True)
     st.write("Upload a customer master file to check for duplicates against it.")
-    
-    # File uploader for customer master file
     customer_file = st.file_uploader("Upload Customer Master File", type=["xlsx", "csv"], key="customer_file")
+    
+    # Account Master File uploader
+    st.markdown('<div class="master-file-header">Account Master File (Optional)</div>', unsafe_allow_html=True)
+    st.write("Upload an account master file to match customer duplicates with account information.")
+    account_file = st.file_uploader("Upload Account Master File", type=["xlsx", "csv"], key="account_file")
+    
     st.markdown('</div>', unsafe_allow_html=True)
     
     # Load customer master file if uploaded
     if customer_file is not None and "customer_df" not in st.session_state:
         st.session_state.customer_df = load_data(customer_file)
         st.write("Customer Master File loaded successfully.")
+    
+    # Load account master file if uploaded
+    if account_file is not None and "account_df" not in st.session_state:
+        st.session_state.account_df = load_data(account_file)
+        st.write("Account Master File loaded successfully.")
     
     if uploaded_file is not None:
         # Process the file on first upload and store the result in session_state
@@ -818,8 +958,21 @@ def main():
                         # If no customer master file is uploaded, use the input file itself
                         customer_df = df.copy()
                     
+                    # Get account master file if available
+                    account_df = None
+                    if "account_df" in st.session_state:
+                        account_df = st.session_state.account_df
+                    
                     st.write("Processing tagged data...")
-                    tagged_df = generate_tagged_data(df, st.session_state.dup_groups, columns, st.session_state.similarity_details, customer_df)
+                    tagged_df = generate_tagged_data(
+                        df, 
+                        st.session_state.dup_groups, 
+                        columns, 
+                        st.session_state.similarity_details, 
+                        customer_df,
+                        account_df
+                    )
+                    
                     st.session_state.tagged_df = tagged_df
                     
                     # Create final dataframe with only Original and Not Duplicate records
@@ -830,6 +983,9 @@ def main():
                     # We'll keep this section for the master_check_df which is used for download buttons
                     if "customer_df" in st.session_state:
                         master_check_df = tagged_df[['Customer_DB_Status', 'Customer_DB_Details']].copy()
+                        if "account_df" in st.session_state and 'Account Number' in tagged_df.columns:
+                            master_check_df['Account Number'] = tagged_df['Account Number']
+                            master_check_df['Last Shipment Date'] = tagged_df['Last Shipment Date']
                         st.session_state.master_check_df = master_check_df
                     
                     # Render download buttons
@@ -858,6 +1014,23 @@ def main():
         for key in list(st.session_state.keys()):
             del st.session_state[key]
         st.rerun()
+
+# UI Components
+def load_data(uploaded_file):
+    """Load data from uploaded file"""
+    if uploaded_file.name.endswith('.xlsx'):
+        df = pd.read_excel(uploaded_file)
+    elif uploaded_file.name.endswith('.csv'):
+        df = pd.read_csv(uploaded_file)
+    else:
+        st.error("Unsupported file format. Please upload an Excel or CSV file.")
+        return None
+    
+    # Convert all columns to string to ensure consistent processing
+    for col in df.columns:
+        df[col] = df[col].astype(str)
+    
+    return df
 
 if __name__ == "__main__":
     main()
